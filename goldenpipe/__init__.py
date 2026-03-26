@@ -7,9 +7,9 @@ Usage:
 __version__ = "0.1.0"
 
 from goldenpipe.pipeline import run, Pipeline, PipeResult
-from goldenpipe.decisions import decide_flow, decide_match, FlowDecision, MatchDecision
+from goldenpipe.decisions import severity_gate, pii_router, row_count_gate
 
 __all__ = [
     "run", "Pipeline", "PipeResult",
-    "decide_flow", "decide_match", "FlowDecision", "MatchDecision",
+    "severity_gate", "pii_router", "row_count_gate",
 ]

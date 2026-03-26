@@ -95,6 +95,7 @@ class TestImports:
         assert hasattr(gp, "__version__")
 
     def test_import_decisions(self):
-        from goldenpipe import decide_flow, decide_match
-        assert callable(decide_flow)
-        assert callable(decide_match)
+        from goldenpipe import severity_gate, pii_router, row_count_gate
+        assert callable(severity_gate)
+        assert callable(pii_router)
+        assert callable(row_count_gate)

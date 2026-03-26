@@ -7,7 +7,7 @@ from pathlib import Path
 
 import polars as pl
 
-from goldenpipe.decisions import decide_flow, decide_match, FlowDecision, MatchDecision
+from goldenpipe.decisions import severity_gate, pii_router, row_count_gate
 
 # Lazy imports for graceful degradation
 try:
@@ -68,8 +68,6 @@ class Pipeline:
         self._check_result = None
         self._transform_result = None
         self._match_result = None
-        self._flow_decision: FlowDecision | None = None
-        self._match_decision: MatchDecision | None = None
         self._skipped: list[str] = []
         self._errors: list[str] = []
         self._reasoning: dict[str, str] = {}
@@ -122,16 +120,24 @@ class Pipeline:
             self._reasoning["flow"] = "Skipped: pip install goldenflow"
             return
 
-        self._flow_decision = decide_flow(self._check_result)
-
-        if self._flow_decision.abort:
-            self._errors.append(f"Pipeline aborted: {self._flow_decision.reason}")
-            self._reasoning["flow"] = f"Aborted: {self._flow_decision.reason}"
+        # Check for critical findings that should abort
+        from goldenpipe.models.context import PipeContext
+        ctx = PipeContext()
+        findings = getattr(self._check_result, "findings", []) or []
+        ctx.artifacts["findings"] = [
+            {"severity": getattr(f, "severity", "info"), "check": getattr(f, "check", "")}
+            if not isinstance(f, dict) else f
+            for f in findings
+        ]
+        gate = severity_gate(ctx)
+        if gate and gate.abort:
+            self._errors.append(f"Pipeline aborted: {gate.reason}")
+            self._reasoning["flow"] = f"Aborted: {gate.reason}"
             return
 
-        if self._flow_decision.skip:
+        if not findings:
             self._skipped.append("flow")
-            self._reasoning["flow"] = self._flow_decision.reason
+            self._reasoning["flow"] = "No quality issues found"
             return
 
         t0 = time.time()
@@ -154,31 +160,43 @@ class Pipeline:
             return
 
         df = self._load_data()
-        self._match_decision = decide_match(
-            self._check_result, df.height, self.strategy_override,
-        )
 
-        if self._match_decision.skip:
+        # Use row_count_gate and pii_router for routing decisions
+        from goldenpipe.models.context import PipeContext
+        ctx = PipeContext(metadata={"input_rows": df.height if df is not None else 0})
+        findings = getattr(self._check_result, "findings", []) or []
+        ctx.artifacts["findings"] = [
+            {"severity": getattr(f, "severity", "info"), "check": getattr(f, "check", "")}
+            if not isinstance(f, dict) else f
+            for f in findings
+        ]
+
+        gate = row_count_gate(ctx)
+        if gate and "goldenmatch.dedupe" in gate.skip:
             self._skipped.append("match")
-            self._reasoning["match"] = self._match_decision.reason
+            self._reasoning["match"] = gate.reason
             return
+
+        pii_decision = pii_router(ctx)
+        use_pprl = pii_decision is not None or self.strategy_override == "pprl"
+        strategy = self.strategy_override or ("pprl" if use_pprl else "auto")
 
         t0 = time.time()
         try:
-            if self._match_decision.strategy == "pprl":
-                self._reasoning["match"] = self._match_decision.reason
+            if strategy == "pprl":
+                self._reasoning["match"] = pii_decision.reason if pii_decision else "PPRL strategy"
                 self._match_result = goldenmatch.dedupe_df(df)
-            elif self._match_decision.strategy == "auto":
+            elif strategy == "auto":
                 session = goldenmatch.AgentSession()
                 result = session.deduplicate(self.source)
                 self._match_result = result.get("results") if isinstance(result, dict) else result
                 self._reasoning["match"] = (
-                    result.get("reasoning", {}).get("why", self._match_decision.reason)
-                    if isinstance(result, dict) else self._match_decision.reason
+                    result.get("reasoning", {}).get("why", "Auto-detect strategy")
+                    if isinstance(result, dict) else "Auto-detect strategy"
                 )
             else:
                 self._match_result = goldenmatch.dedupe_df(df)
-                self._reasoning["match"] = self._match_decision.reason
+                self._reasoning["match"] = f"Strategy: {strategy}"
         except Exception as e:
             self._errors.append(f"GoldenMatch: {e}")
             self._reasoning["match"] = f"Failed: {e}"
