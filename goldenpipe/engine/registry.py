@@ -50,11 +50,12 @@ class StageRegistry:
 
         for ep in eps:
             try:
-                stage_cls = ep.load()
-                if hasattr(stage_cls, "info") and hasattr(stage_cls, "run"):
-                    self._stages[ep.name] = stage_cls
-                elif hasattr(stage_cls, "info"):
-                    self._stages[ep.name] = stage_cls()
+                obj = ep.load()
+                if isinstance(obj, type):
+                    # It's a class — instantiate it
+                    obj = obj()
+                if hasattr(obj, "info") and hasattr(obj, "run"):
+                    self._stages[ep.name] = obj
             except Exception:
                 pass
 
