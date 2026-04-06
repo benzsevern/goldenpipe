@@ -86,6 +86,7 @@ def _build_config_from_contexts(contexts: list, df) -> object | None:
 
     name_cols = [c for c in contexts if c.inferred_type == ColumnType.NAME and c.is_identifier]
     email_cols = [c for c in contexts if c.inferred_type == ColumnType.EMAIL]
+    geo_cols = [c for c in contexts if c.inferred_type == ColumnType.GEO]
 
     matchkeys = []
 
@@ -114,9 +115,17 @@ def _build_config_from_contexts(contexts: list, df) -> object | None:
             fields=fuzzy_fields,
         ))
 
-    # Fallback: if no identifier columns found, use all string columns
+    # Fallback: if no identifier columns found, use discriminative string columns.
+    # Exclude low-cardinality columns (e.g. hospital_type with 5 values) — they inflate
+    # fuzzy scores without providing meaningful discrimination.
     if not matchkeys:
         string_cols = [c for c in contexts if c.inferred_type in (ColumnType.STRING, ColumnType.NAME)]
+        if df is not None:
+            min_cardinality = max(50, int(df.height * 0.01))  # at least 1% unique values
+            string_cols = [
+                c for c in string_cols
+                if df[c.name].n_unique() >= min_cardinality
+            ]
         fallback_fields = []
         for col in string_cols[:3]:
             fallback_fields.append(MatchkeyField(
@@ -141,26 +150,90 @@ def _build_config_from_contexts(contexts: list, df) -> object | None:
         )
         return None
 
-    # Blocking: use last_name soundex for person data, or best name column
+    # Blocking: compound geo columns with name to prevent cross-region false positives
     blocking = None
+    best_geo = None
+
+    # Find best geo column for compound blocking.
+    # Prefer low-cardinality geo (like state ~50 values) over high-cardinality (like city ~3000)
+    # because low-cardinality geo provides broader geographic discrimination and avoids
+    # same-city-name-different-state false positives.
+    if geo_cols and df is not None:
+        max_null_rate = 0.20
+        geo_candidates = []
+        for g in geo_cols:
+            null_rate = df[g.name].null_count() / df.height if df.height > 0 else 1.0
+            if null_rate <= max_null_rate:
+                cardinality = df[g.name].n_unique()
+                geo_candidates.append((g.name, cardinality))
+        if geo_candidates:
+            # Pick lowest cardinality (broadest geo level, e.g. state over city)
+            geo_candidates.sort(key=lambda x: x[1])
+            best_geo = geo_candidates[0][0]
+
     last_name_cols = [c for c in name_cols if "last" in c.name.lower()]
     if last_name_cols:
-        blocking = BlockingConfig(
-            strategy="multi_pass",
-            keys=[BlockingKeyConfig(fields=[last_name_cols[0].name], transforms=["lowercase", "soundex"])],
-            passes=[
-                BlockingKeyConfig(fields=[last_name_cols[0].name], transforms=["lowercase", "soundex"]),
-                BlockingKeyConfig(fields=[last_name_cols[0].name], transforms=["lowercase", "substring:0:3"]),
-            ],
-            max_block_size=500,
-            skip_oversized=True,
-        )
+        best_name = last_name_cols[0].name
+        if best_geo:
+            blocking = BlockingConfig(
+                strategy="multi_pass",
+                keys=[BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "strip"])],
+                passes=[
+                    BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "strip"]),
+                    BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "substring:0:3"]),
+                    BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "soundex"]),
+                ],
+                max_block_size=500,
+                skip_oversized=True,
+            )
+        else:
+            blocking = BlockingConfig(
+                strategy="multi_pass",
+                keys=[BlockingKeyConfig(fields=[best_name], transforms=["lowercase", "soundex"])],
+                passes=[
+                    BlockingKeyConfig(fields=[best_name], transforms=["lowercase", "soundex"]),
+                    BlockingKeyConfig(fields=[best_name], transforms=["lowercase", "substring:0:3"]),
+                ],
+                max_block_size=500,
+                skip_oversized=True,
+            )
     elif name_cols:
-        blocking = BlockingConfig(
-            keys=[BlockingKeyConfig(fields=[name_cols[0].name], transforms=["lowercase", "soundex"])],
-            max_block_size=500,
-            skip_oversized=True,
-        )
+        best_name = name_cols[0].name
+        if best_geo:
+            blocking = BlockingConfig(
+                strategy="multi_pass",
+                keys=[BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "strip"])],
+                passes=[
+                    BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "strip"]),
+                    BlockingKeyConfig(fields=[best_geo, best_name], transforms=["lowercase", "soundex"]),
+                ],
+                max_block_size=500,
+                skip_oversized=True,
+            )
+        else:
+            blocking = BlockingConfig(
+                keys=[BlockingKeyConfig(fields=[best_name], transforms=["lowercase", "soundex"])],
+                max_block_size=500,
+                skip_oversized=True,
+            )
+
+    # Fallback: no name columns, but we have string columns in matchkeys + geo columns
+    if not blocking and best_geo and matchkeys:
+        # Use the first fuzzy matchkey field as the name anchor
+        fuzzy_mks = [mk for mk in matchkeys if mk.type == "weighted"]
+        if fuzzy_mks and fuzzy_mks[0].fields:
+            anchor = fuzzy_mks[0].fields[0].field
+            blocking = BlockingConfig(
+                strategy="multi_pass",
+                keys=[BlockingKeyConfig(fields=[best_geo, anchor], transforms=["lowercase", "strip"])],
+                passes=[
+                    BlockingKeyConfig(fields=[best_geo, anchor], transforms=["lowercase", "strip"]),
+                    BlockingKeyConfig(fields=[best_geo, anchor], transforms=["lowercase", "soundex"]),
+                ],
+                max_block_size=500,
+                skip_oversized=True,
+            )
+            logger.info("Geo-compound blocking from string fallback: [%s, %s]", best_geo, anchor)
 
     # If we still have no blocking, let GoldenMatch auto-suggest
     if not blocking:
