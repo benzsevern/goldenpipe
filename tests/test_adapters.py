@@ -141,3 +141,80 @@ class TestBuildConfigFromContexts:
         # Should use last_name soundex, no geo compound
         primary_fields = config.blocking.keys[0].fields
         assert primary_fields == ["last_name"]
+
+    def test_high_null_geo_excluded(self):
+        """Geo columns with >20% nulls should not be used for compound blocking."""
+        from goldenpipe.adapters.match import _build_config_from_contexts
+        from goldenpipe.models.column_context import ColumnType
+
+        contexts = [
+            MagicMock(name="last_name", inferred_type=ColumnType.NAME, is_identifier=True),
+            MagicMock(name="state", inferred_type=ColumnType.GEO, is_identifier=False),
+        ]
+        contexts[0].name = "last_name"
+        contexts[1].name = "state"
+
+        import polars as pl
+        # 40% nulls in state
+        df = pl.DataFrame({
+            "last_name": ["Smith", "Jones", "Doe", "Brown", "Lee"],
+            "state": ["AL", "CA", None, None, "NY"],
+        })
+        config = _build_config_from_contexts(contexts, df)
+        assert config is not None
+        # Should fall back to name-only since geo has high null rate
+        primary_fields = config.blocking.keys[0].fields
+        assert primary_fields == ["last_name"]
+
+    def test_lowest_cardinality_geo_selected(self):
+        """When multiple geo columns exist, lowest cardinality should be picked."""
+        from goldenpipe.adapters.match import _build_config_from_contexts
+        from goldenpipe.models.column_context import ColumnType
+
+        contexts = [
+            MagicMock(name="facility_name", inferred_type=ColumnType.STRING, is_identifier=False),
+            MagicMock(name="state", inferred_type=ColumnType.GEO, is_identifier=False),
+            MagicMock(name="citytown", inferred_type=ColumnType.GEO, is_identifier=False),
+        ]
+        contexts[0].name = "facility_name"
+        contexts[1].name = "state"
+        contexts[2].name = "citytown"
+
+        import polars as pl
+        # state has 5 unique, citytown has 60 unique — state should win (lowest cardinality)
+        names = [f"HOSPITAL {i}" for i in range(60)]
+        states = ["AL", "CA", "NY", "TX", "FL"]
+        cities = [f"CITY_{i}" for i in range(60)]
+        rows = [{"facility_name": names[i], "state": states[i % 5], "citytown": cities[i]}
+                for i in range(60)]
+        df = pl.DataFrame(rows)
+
+        config = _build_config_from_contexts(contexts, df)
+        assert config is not None
+        primary_fields = config.blocking.keys[0].fields
+        assert "state" in primary_fields, f"Expected 'state' (lowest cardinality), got {primary_fields}"
+
+    def test_soundex_not_applied_to_geo(self):
+        """Soundex passes should only apply to name fields, not geo columns."""
+        from goldenpipe.adapters.match import _build_config_from_contexts
+        from goldenpipe.models.column_context import ColumnType
+
+        contexts = [
+            MagicMock(name="last_name", inferred_type=ColumnType.NAME, is_identifier=True),
+            MagicMock(name="state", inferred_type=ColumnType.GEO, is_identifier=False),
+        ]
+        contexts[0].name = "last_name"
+        contexts[1].name = "state"
+
+        import polars as pl
+        rows = [{"last_name": f"Name{i}", "state": s}
+                for s in ["AL", "CA", "NY"] for i in range(20)]
+        df = pl.DataFrame(rows)
+
+        config = _build_config_from_contexts(contexts, df)
+        assert config is not None
+        # Check that soundex passes only apply to name field, not compound geo+name
+        for p in config.blocking.passes:
+            if "soundex" in p.transforms:
+                assert p.fields == ["last_name"], \
+                    f"Soundex should only apply to name field, got fields={p.fields}"
