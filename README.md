@@ -1,3 +1,5 @@
+> **Moved.** This repo has moved into the [`benzsevern/goldenmatch`](https://github.com/benzsevern/goldenmatch) monorepo at `packages/python/goldenpipe/`. This repo is archived; new development happens in the monorepo.
+
 <!-- mcp-name: io.github.benzsevern/goldenpipe -->
 # GoldenPipe
 
